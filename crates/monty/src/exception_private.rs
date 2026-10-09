@@ -1278,6 +1278,15 @@ pub(crate) trait ExcTypeExt: Sized {
         SimpleException::new_msg(ExcType::ValueError, "negative count").into()
     }
 
+    /// Creates the `ValueError` CPython's float-to-string conversion raises for a
+    /// precision above `MAX_FLOAT_PRECISION` (`INT_MAX - 1024`).
+    ///
+    /// Matches CPython's format: `ValueError: precision too big`
+    #[must_use]
+    fn value_error_precision_too_big() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "precision too big").into()
+    }
+
     /// Creates a TypeError for isinstance() arg 2.
     ///
     /// Matches CPython's format: `TypeError: isinstance() arg 2 must be a type, a tuple of types, or a union`
@@ -1676,6 +1685,20 @@ pub(crate) trait ExcTypeExt: Sized {
     #[must_use]
     fn overflow_c_long() -> RunError {
         SimpleException::new_msg(ExcType::OverflowError, "Python int too large to convert to C long").into()
+    }
+
+    /// `OverflowError: Python int too large for C unsigned long`, from Argument
+    /// Clinic's `unsigned_long` converter on an int beyond `u64`.
+    #[must_use]
+    fn overflow_c_unsigned_long() -> RunError {
+        SimpleException::new_msg(ExcType::OverflowError, "Python int too large for C unsigned long").into()
+    }
+
+    /// `ValueError: Cannot convert negative int`, which the unsigned Argument
+    /// Clinic converters raise before checking an int's width.
+    #[must_use]
+    fn value_error_negative_int() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "Cannot convert negative int").into()
     }
 
     /// Creates the TypeError for three-argument `pow()` with a non-integer operand and no
