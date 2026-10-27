@@ -26,6 +26,32 @@ fn repeated_class_keyword_returns_syntax_error() {
 }
 
 #[test]
+fn missing_nonlocal_binding_in_nested_function_returns_syntax_error() {
+    let err =
+        get_parse_err("def outer():\n    def inner():\n        nonlocal absent\n        absent += 1\n    inner()");
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"no binding for nonlocal 'absent' found");
+}
+
+#[test]
+fn default_assignment_before_global_declaration_returns_syntax_error() {
+    let err = get_parse_err(
+        "def outer():\n    def inner(value=(bound := 0)):\n        return value\n    global bound\nouter()",
+    );
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"name 'bound' is assigned to before global declaration");
+}
+
+#[test]
+fn default_assignment_before_nonlocal_declaration_returns_syntax_error() {
+    let err = get_parse_err(
+        "def outer():\n    bound = 10\n    def middle():\n        def inner(value=(bound := 0)):\n            return value\n        nonlocal bound\n    middle()\nouter()",
+    );
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"name 'bound' is assigned to before nonlocal declaration");
+}
+
+#[test]
 fn simple_classes_compile_successfully() {
     // Simple classes are supported; only the advanced forms below are rejected.
     let result = MontyRun::new(
@@ -578,23 +604,6 @@ fn deeply_nested_boolean_or_exceed_limit() {
     assert_snapshot!(err.message().unwrap(), @"Source is too deeply nested");
 }
 
-// === Runtime NotImplementedError tests ===
-// These test that unimplemented features return proper errors instead of panicking.
-
-/// Helper to run code and get the exception from a runtime error.
-fn run_and_get_err(code: &str) -> MontyException {
-    let mut runner =
-        MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).expect("should parse");
-    runner.run_no_limits(vec![]).expect_err("expected runtime error")
-}
-
-#[test]
-fn matrix_multiplication_returns_not_implemented_error() {
-    // The @ operator (matrix multiplication) is not supported at runtime
-    let err = run_and_get_err("1 @ 2");
-    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
-}
-
 #[test]
 fn matrix_multiplication_augmented_assignment_returns_syntax_error() {
     // The @= operator (augmented matrix multiplication) is not supported at compile time
@@ -976,6 +985,18 @@ fn module_with_too_many_interned_strings_returns_syntax_error() {
         err.message(),
         Some("module has too many distinct names; the bytecode format supports up to 65536 interned strings"),
     );
+}
+
+#[test]
+fn dotted_import_with_too_many_components_returns_syntax_error() {
+    // each component interns the path through it, so the chain is capped
+    let code = format!("import a{}", ".a".repeat(32));
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
+    let err = result.expect_err("expected compile error");
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_eq!(err.message(), Some("dotted import has more than 32 components"));
+    let code = format!("from a{} import b", ".a".repeat(31));
+    MontyRun::new(code, "test.py", vec![], CompileOptions::default()).expect("32 components compile");
 }
 
 #[test]

@@ -19,9 +19,11 @@ use crate::{
     hash::{HashValue, hash_f64},
     heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead},
     intern::StaticStrings,
+    py_value::PyValue,
     types::{
         LazyHeapSet, PyTrait, Type,
         str::{StringRepr, allocate_string},
+        r#type::strip_underscores,
     },
     value::{EitherStr, Value, eq_f64},
 };
@@ -318,15 +320,11 @@ enum Operand {
 /// `OverflowError`); `None` for a non-number so the operation reports
 /// `NotImplemented` and the reflected form gets its turn.
 fn operand(value: &Value, vm: &VM<'_>) -> RunResult<Option<Operand>> {
-    Ok(match value {
-        Value::Float(f) => Some(Operand::Real(*f)),
-        Value::Int(i) => Some(Operand::Real(*i as f64)),
-        Value::Bool(b) => Some(Operand::Real(f64::from(*b))),
-        Value::Ref(id) => match vm.heap.get(*id) {
-            HeapData::Complex(c) => Some(Operand::Complex(*c)),
-            HeapData::LongInt(li) => Some(Operand::Real(li.to_f64_checked()?)),
-            _ => None,
-        },
+    Ok(match value.py_value(vm) {
+        PyValue::Float(value) => Some(Operand::Real(value)),
+        PyValue::Int(integer) => Some(Operand::Real(integer.to_f64_checked(vm)?)),
+        PyValue::Bool(value) => Some(Operand::Real(f64::from(value))),
+        PyValue::Complex(value) => Some(Operand::Complex(*value.get(vm.heap))),
         _ => None,
     })
 }
@@ -382,6 +380,8 @@ fn init_single(value: Value, vm: &mut VM<'_>) -> RunResult<Value> {
     defer_drop!(value, vm);
     let parsed = match value.as_either_str(vm.heap) {
         Some(text) => Some(parse(text.as_str(vm.interns))?),
+        // `Decimal.__complex__`; Decimals take no part in complex arithmetic.
+        None if let PyValue::Decimal(d) = value.py_value(vm) => Some(Complex::new(d.get(vm.heap).to_f64()?, 0.0)),
         None => operand(value, vm)?.map(widen),
     };
     match parsed {
@@ -425,11 +425,16 @@ impl FromValue for Part {
     const EXPECTED_TYPE_NAME: Option<&'static str> = Some("a real number");
 
     fn from_value(value: Value, vm: &mut VM<'_>) -> Result<Self, FromValueFail> {
-        let result = match operand(&value, vm) {
-            Ok(Some(Operand::Real(r))) => Ok(Self::Real(r)),
-            Ok(Some(Operand::Complex(c))) => Ok(Self::Complex(c)),
-            Ok(None) => Err(FromValueFail::WrongType),
-            Err(err) => Err(FromValueFail::Raise(err)),
+        let result = if let PyValue::Decimal(d) = value.py_value(vm) {
+            // `Decimal.__float__`, as for `complex(Decimal)`.
+            d.get(vm.heap).to_f64().map(Self::Real).map_err(FromValueFail::Raise)
+        } else {
+            match operand(&value, vm) {
+                Ok(Some(Operand::Real(r))) => Ok(Self::Real(r)),
+                Ok(Some(Operand::Complex(c))) => Ok(Self::Complex(c)),
+                Ok(None) => Err(FromValueFail::WrongType),
+                Err(err) => Err(FromValueFail::Raise(err)),
+            }
         };
         value.drop_with(vm);
         result
@@ -513,25 +518,6 @@ fn parse(text: &str) -> RunResult<Complex> {
     } else {
         Err(malformed())
     }
-}
-
-/// Removes digit-separator underscores, or returns `None` when one is not
-/// strictly between two digits (CPython's `_Py_string_to_number_with_underscores`).
-fn strip_underscores(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    for (i, c) in text.char_indices() {
-        if c == '_' {
-            let before = i.checked_sub(1).map(|j| bytes[j]);
-            let after = bytes.get(i + 1);
-            if !(before.is_some_and(|b| b.is_ascii_digit()) && after.is_some_and(u8::is_ascii_digit)) {
-                return None;
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    Some(out)
 }
 
 /// The longest float literal at the start of `s`, as CPython's
@@ -633,6 +619,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Complex> {
         }
         .to_string();
         Ok(allocate_string(text, vm.heap))
+    }
+
+    fn py_abs_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        Ok(Some(Value::Float(self.get(vm.heap).abs()?)))
     }
 
     fn py_neg_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {

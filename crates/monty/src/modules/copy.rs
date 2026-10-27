@@ -14,7 +14,7 @@ use crate::{
     heap::{ContainsHeap, DropGuard, DropWithContext, HeapData, HeapId, HeapReadOutput},
     intern::StaticStrings,
     modules::ModuleFunctions,
-    types::{Dict, List, Module, instance_call_copy_hook},
+    types::{Dict, List, Module, hash_table::TableCursor, instance_call_copy_hook},
     value::{VALUE_SIZE, Value},
 };
 
@@ -159,6 +159,11 @@ fn shallow_copy(value: &Value, vm: &mut VM<'_>) -> RunResult<Value> {
             // A second generator at the same point in the same sequence, which is
             // what CPython's `__getstate__`/`__setstate__` pair produces.
             HeapReadOutput::Random(random) => Ok(random.allocate_like(vm)),
+            // `Context.__copy__`: the same settings and flags in a new object.
+            HeapReadOutput::DecimalContext(context) => {
+                let settings = *context.get(vm.heap);
+                Ok(Value::Ref(vm.heap.allocate(HeapData::DecimalContext(settings))))
+            }
             _ => unreachable!("`classify` said this type is rebuilt, so `shallow_copy` must rebuild it"),
         },
     }
@@ -170,10 +175,10 @@ fn shallow_copy(value: &Value, vm: &mut VM<'_>) -> RunResult<Value> {
 
 /// Deep-copying, implemented by the heap types `copy.deepcopy` rebuilds.
 ///
-/// Narrow on purpose: only eleven of the fifty-seven heap types are rebuilt, so
-/// this is a trait of its own rather than a method on
-/// [`PyTrait`](crate::types::PyTrait) that the other forty-six would carry
-/// meaninglessly. The method is required, with no
+/// Narrow on purpose: only eleven of the sixty-seven heap types implement it (a
+/// `decimal.Context`, holding no references, is rebuilt inline), so this is a
+/// trait of its own rather than a method on [`PyTrait`](crate::types::PyTrait)
+/// that the others would carry meaninglessly. The method is required, with no
 /// default — a default would be the "refuse it" answer, which is legitimate for
 /// most types, so forgetting to override it would look exactly like deciding
 /// not to. Which types reach this at all is settled by [`classify`].
@@ -231,6 +236,11 @@ pub(crate) fn deep_copy(source: &Value, memo: &mut Memo, vm: &mut VM<'_>) -> Run
             HeapReadOutput::BoundMethod(bound) => bound.py_deep_copy(source, memo, vm),
             HeapReadOutput::Partial(partial) => partial.py_deep_copy(source, memo, vm),
             HeapReadOutput::Random(random) => random.py_deep_copy(source, memo, vm),
+            // A context holds no references, so its deep copy is its shallow one.
+            HeapReadOutput::DecimalContext(context) => {
+                let settings = *context.get(vm.heap);
+                Ok(Value::Ref(vm.heap.allocate(HeapData::DecimalContext(settings))))
+            }
             _ => unreachable!("`classify` said this type is rebuilt, so `deep_copy` must rebuild it"),
         },
     }?;
@@ -282,16 +292,20 @@ fn classify(output: &HeapReadOutput<'_>) -> Copyability {
         | HeapReadOutput::Instance(_)
         | HeapReadOutput::BoundMethod(_)
         | HeapReadOutput::Partial(_)
-        | HeapReadOutput::Random(_) => Copyability::Rebuilt,
+        | HeapReadOutput::Random(_)
+        | HeapReadOutput::DecimalContext(_) => Copyability::Rebuilt,
         // A shallow copy of an immutable container holds the same items, so
         // CPython hands back the original; only `deepcopy` rebuilds these.
         HeapReadOutput::Tuple(_) | HeapReadOutput::FrozenSet(_) => Copyability::ImmutableContainer,
+        // CPython's cache wrappers share their state through both copy operations.
+        HeapReadOutput::LruCache(_) => Copyability::Shared,
         // Leaves and immutable containers Monty can never mutate, so a copy
         // that shared them is indistinguishable from one that rebuilt them.
         HeapReadOutput::Str(_)
         | HeapReadOutput::Bytes(_)
         | HeapReadOutput::LongInt(_)
         | HeapReadOutput::Complex(_)
+        | HeapReadOutput::Decimal(_)
         | HeapReadOutput::Range(_)
         | HeapReadOutput::Slice(_)
         | HeapReadOutput::RePattern(_)
@@ -312,6 +326,7 @@ fn classify(output: &HeapReadOutput<'_>) -> Copyability {
         | HeapReadOutput::NamedTupleClass(_)
         | HeapReadOutput::HostClassType(_)
         | HeapReadOutput::Closure(_)
+        | HeapReadOutput::DataclassMethod(_)
         // Type forms: `list[int]` and `int | None`. Nothing can mutate one, so
         // sharing is visible only to `is` — CPython rebuilds them through
         // `operator.getitem`, see `limitations/copy.md`.
@@ -342,7 +357,9 @@ fn classify(output: &HeapReadOutput<'_>) -> Copyability {
         | HeapReadOutput::DictValueIterator(_)
         | HeapReadOutput::SetIterator(_)
         | HeapReadOutput::CallableIterator(_)
+        | HeapReadOutput::DirScan(_)
         | HeapReadOutput::Itertools(_)
+        | HeapReadOutput::Csv(_)
         | HeapReadOutput::Module(_)
         | HeapReadOutput::Coroutine(_)
         | HeapReadOutput::GatherFuture(_)
@@ -351,7 +368,9 @@ fn classify(output: &HeapReadOutput<'_>) -> Copyability {
         | HeapReadOutput::ExtFunction(_)
         | HeapReadOutput::Cell(_)
         | HeapReadOutput::DataclassField(_)
-        | HeapReadOutput::DataclassParams(_) => Copyability::Refused,
+        | HeapReadOutput::DataclassParams(_)
+        | HeapReadOutput::DecimalSignalDict(_)
+        | HeapReadOutput::DecimalContextManager(_) => Copyability::Refused,
     }
 }
 
@@ -374,18 +393,16 @@ pub(crate) fn deep_copy_attrs(
     vm.heap
         .tracker
         .check_allocation(expected_len.saturating_mul(2 * VALUE_SIZE))?;
+    // `__dict__` is a dict, and CPython copies it by iterating it.
+    let mut cursor = TableCursor::new(expected_len);
     for index in 0.. {
         let (_, vm) = guard.as_parts_mut();
         vm.heap.tracker.check_time_every(index)?;
-        // `__dict__` is a dict, and CPython copies it by iterating it.
-        if attrs(source_id, vm).len() != expected_len {
-            return Err(ExcType::runtime_error_dict_changed_size());
-        }
-        let Some((key, value)) = clone_pair(attrs(source_id, vm), index, vm) else {
+        let Some((key, value)) = attrs(source_id, vm).clone_next_pair(&mut cursor, vm.heap)? else {
             break;
         };
         let (key_copy, value_copy) = deep_copy_pair(key, value, memo, vm)?;
-        let HeapReadOutput::Instance(mut instance) = vm.heap.read(copy_id) else {
+        let HeapReadOutput::Instance(instance) = vm.heap.read(copy_id) else {
             unreachable!("caller allocated an instance")
         };
         let replaced = instance.attrs_mut().set(key_copy, value_copy, vm)?;
@@ -417,12 +434,6 @@ pub(crate) fn deep_copy_slots<'h>(
     }
     let (copied, _) = guard.into_parts();
     Ok(copied)
-}
-
-/// Clones the `index`th key/value pair out of a dict, or `None` past its end.
-pub(crate) fn clone_pair(dict: &Dict, index: usize, vm: &VM<'_>) -> Option<(Value, Value)> {
-    let (key, value) = dict.item_at(index)?;
-    Some((key.clone_with_heap(vm.heap), value.clone_with_heap(vm.heap)))
 }
 
 /// Deep-copies an owned key and value, releasing both either way.
@@ -518,7 +529,7 @@ impl Memo {
     pub(crate) fn insert(&mut self, source: &Value, copy: &Value, vm: &mut VM<'_>) -> RunResult<()> {
         let key = source.id().into_value(vm.heap);
         let value = copy.clone_with_heap(vm.heap);
-        let HeapReadOutput::Dict(mut dict) = vm.heap.read(self.dict_id()) else {
+        let HeapReadOutput::Dict(dict) = vm.heap.read(self.dict_id()) else {
             unreachable!("memo is a dict")
         };
         if let Some(replaced) = dict.set(key, value, vm)? {
@@ -580,11 +591,10 @@ fn clone_attrs(id: HeapId, vm: &mut VM<'_>) -> RunResult<Vec<(Value, Value)>> {
         .tracker
         .check_allocation(len.saturating_mul(2).saturating_mul(VALUE_SIZE))?;
     let mut guard = DropGuard::new(Vec::with_capacity(len), vm);
-    for index in 0..len {
-        let (pairs, vm) = guard.as_parts_mut();
+    let (pairs, vm) = guard.as_parts_mut();
+    // One borrow for the whole snapshot, so no user code can run under it.
+    for (index, (key, value)) in attrs(id, vm).iter().enumerate() {
         vm.heap.tracker.check_time_every(index)?;
-        let attrs = attrs(id, vm);
-        let (key, value) = attrs.item_at(index).expect("index is in bounds");
         pairs.push((key.clone_with_heap(vm.heap), value.clone_with_heap(vm.heap)));
     }
     Ok(guard.into_inner())
@@ -617,7 +627,7 @@ fn insert_pairs(dict_id: HeapId, pairs: Vec<(Value, Value)>, vm: &mut VM<'_>) ->
         let Some((key, value)) = pairs.next() else {
             break;
         };
-        let HeapReadOutput::Dict(mut dest) = vm.heap.read(dict_id) else {
+        let HeapReadOutput::Dict(dest) = vm.heap.read(dict_id) else {
             unreachable!("copy was allocated as a dict")
         };
         // `set` takes ownership of the pair and releases it on failure.
@@ -639,7 +649,7 @@ fn insert_attrs(id: HeapId, pairs: Vec<(Value, Value)>, vm: &mut VM<'_>) -> RunR
         let Some((key, value)) = pairs.next() else {
             break;
         };
-        let HeapReadOutput::Instance(mut instance) = vm.heap.read(id) else {
+        let HeapReadOutput::Instance(instance) = vm.heap.read(id) else {
             unreachable!("caller allocated an instance")
         };
         let replaced = instance.attrs_mut().set(key, value, vm)?;

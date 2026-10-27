@@ -163,6 +163,15 @@ impl MontyObject {
         Self::leaf(MontyNode::TimeZone(value))
     }
 
+    /// A `decimal.Decimal` from its string form, as `str(d)` prints it.
+    ///
+    /// The sandbox parses the text as `Decimal(text)` does, so any numeric string is
+    /// accepted (`"1.20"`, `"1e5"`, `"-NaN"`); feeding it anything else fails there.
+    #[must_use]
+    pub fn decimal(value: impl Into<String>) -> Self {
+        Self::leaf(MontyNode::Decimal(value.into()))
+    }
+
     /// An exception instance as a value (not raised), with its message.
     #[must_use]
     pub fn exception(exc_type: ExcType, arg: Option<String>) -> Self {
@@ -299,6 +308,20 @@ impl MontyObject {
         let root = graph.push(MontyNode::ClassInstance {
             class_type,
             instance_id,
+            attrs,
+        });
+        Self { graph, root }
+    }
+
+    /// A host module named `name` with its attributes, identified by `id`;
+    /// it imports as a `module` object in the sandbox.
+    #[must_use]
+    pub fn module(name: impl Into<String>, id: MontyUuid, attrs: impl IntoIterator<Item = (Self, Self)>) -> Self {
+        let mut graph = MontyGraph::new();
+        let attrs = push_pairs(attrs, &mut graph);
+        let root = graph.push(MontyNode::Module {
+            name: name.into(),
+            id,
             attrs,
         });
         Self { graph, root }
@@ -455,12 +478,14 @@ impl<'a> ObjectRef<'a> {
         }
     }
 
-    /// The `(key, value)` pairs of a dict, or the eager attrs of a class
-    /// instance or class type object; `None` for any other value.
+    /// The `(key, value)` pairs of a dict, or the attrs of a class instance,
+    /// class type object or module; `None` for any other value.
     #[must_use]
     pub fn pairs(&self) -> Option<Vec<(Self, Self)>> {
         let pairs = match self.node() {
-            MontyNode::Dict(pairs) | MontyNode::ClassInstance { attrs: pairs, .. } => pairs,
+            MontyNode::Dict(pairs)
+            | MontyNode::ClassInstance { attrs: pairs, .. }
+            | MontyNode::Module { attrs: pairs, .. } => pairs,
             MontyNode::ClassType(class) => &class.attrs,
             _ => return None,
         };
@@ -512,6 +537,15 @@ impl<'a> ObjectRef<'a> {
         }
     }
 
+    /// The string form of a `decimal.Decimal`, as `str(d)` prints it.
+    #[must_use]
+    pub fn as_decimal(&self) -> Option<&str> {
+        match self.node() {
+            MontyNode::Decimal(value) => Some(value),
+            _ => None,
+        }
+    }
+
     /// The value as a `complex`; an `int` or `float` converts as Python's
     /// `complex()` does, with a zero imaginary part (see [`as_float`](Self::as_float)
     /// for an `int` too large to convert).
@@ -554,6 +588,7 @@ impl<'a> ObjectRef<'a> {
             | MontyNode::NamedTuple { values: items, .. } => !items.is_empty(),
             MontyNode::Dict(pairs) => !pairs.is_empty(),
             MontyNode::TimeDelta(delta) => delta.days != 0 || delta.seconds != 0 || delta.microseconds != 0,
+            MontyNode::Decimal(text) => !decimal_is_zero(text),
             _ => true,
         }
     }
@@ -737,6 +772,7 @@ impl<'a> ObjectRef<'a> {
                 }
                 f.write_char(')')
             }
+            MontyNode::Decimal(text) => write!(f, "Decimal('{text}')"),
             MontyNode::TimeZone(tz) => {
                 if tz.offset_seconds == 0 && tz.name.is_none() {
                     return f.write_str("datetime.timezone.utc");
@@ -762,6 +798,8 @@ impl<'a> ObjectRef<'a> {
             MontyNode::ClassType(class) => write!(f, "<class '{}'>", class.name),
             MontyNode::BuiltinFunction(func) => write!(f, "<built-in function {func}>"),
             MontyNode::Function { name, .. } => write!(f, "<function '{name}' external>"),
+            // a module's repr names it without listing its attrs, as CPython's does
+            MontyNode::Module { name, .. } => write!(f, "<module {}>", StringRepr(name)),
             MontyNode::Repr(s) => write!(f, "Repr({})", StringRepr(s)),
             MontyNode::Cycle(placeholder) => f.write_str(placeholder),
             MontyNode::List(_)
@@ -942,6 +980,18 @@ fn nodes_eq(a: &MontyNode, b: &MontyNode, pending: &mut Vec<(NodeId, NodeId)>) -
                 queue_pairs(xs, ys, pending)
             }
         }
+        (
+            MontyNode::Module {
+                name: x_name,
+                id: x_id,
+                attrs: xs,
+            },
+            MontyNode::Module {
+                name: y_name,
+                id: y_id,
+                attrs: ys,
+            },
+        ) => x_name == y_name && x_id == y_id && queue_pairs(xs, ys, pending),
         // every other pairing is leaf against leaf, or a kind mismatch
         _ => a.is_leaf() && b.is_leaf() && a == b,
     }
@@ -1003,11 +1053,13 @@ impl CallArgs {
     }
 
     /// The positional arguments, in order.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub fn args(&self) -> impl ExactSizeIterator<Item = ObjectRef<'_>> {
         self.arg_ids.iter().map(|id| self.graph.value(*id))
     }
 
     /// The keyword arguments as `(key, value)` views, in order.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub fn kwargs(&self) -> impl ExactSizeIterator<Item = (ObjectRef<'_>, ObjectRef<'_>)> {
         self.kwarg_ids
             .iter()
@@ -1084,6 +1136,7 @@ impl NamedValues {
     }
 
     /// The `(name, value)` pairs, in order.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, ObjectRef<'_>)> {
         self.names
             .iter()
@@ -1370,6 +1423,12 @@ pub enum MontyType {
     ItertoolsTee,
     #[strum(serialize = "itertools._tee_dataobject")]
     ItertoolsTeeDataObject,
+    /// The wrapper `functools.lru_cache` / `functools.cache` returns.
+    #[strum(serialize = "functools._lru_cache_wrapper")]
+    LruCacheWrapper,
+    /// `decimal.Decimal`, qualified the way CPython's `tp_name` is.
+    #[strum(serialize = "decimal.Decimal")]
+    Decimal,
 }
 
 impl fmt::Display for MontyType {
@@ -1758,4 +1817,14 @@ fn monty_datetime_naive(datetime: &MontyDateTime) -> Option<NaiveDateTime> {
         datetime.microsecond,
     )?;
     Some(date.and_time(time))
+}
+
+/// Whether a `Decimal` string form is a (signed) zero: every mantissa digit is `0`.
+///
+/// NaNs and infinities contain letters before any exponent, so they are never zero.
+/// Surrounding whitespace and underscores are ignored, as `Decimal(text)` ignores them.
+fn decimal_is_zero(text: &str) -> bool {
+    let unsigned = text.trim().trim_start_matches(['+', '-']);
+    let mantissa = unsigned.split(['e', 'E']).next().unwrap_or_default();
+    mantissa.bytes().any(|b| b == b'0') && mantissa.bytes().all(|b| matches!(b, b'0' | b'.' | b'_'))
 }

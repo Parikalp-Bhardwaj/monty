@@ -25,8 +25,10 @@
 //! - `Type` ↔ `{ __monty_type__: 'Type', value }`
 //! - `BuiltinFunction` ↔ `{ __monty_type__: 'BuiltinFunction', value }`
 //! - `ClassInstance` → `{ __monty_type__: 'ClassInstance', type, instanceId, attrs }`
+//! - `Module` ↔ `{ __monty_type__: 'Module', name, id, attrs }`
 //! - `FileHandle` ↔ `{ __monty_type__: 'FileHandle', path, mode, position }`
 //! - `Complex` ↔ `{ __monty_type__: 'Complex', real, imag }`
+//! - `Decimal` ↔ `{ __monty_type__: 'Decimal', value }`, `value` being `str(d)`
 //! - `Repr` → plain `string`
 //! - `Cycle` → placeholder `string`
 #![expect(unsafe_code, reason = "napi API is unsafe")]
@@ -105,6 +107,7 @@ fn decode_node<'e>(node: &MontyNode, graph: &MontyGraph, built: &[Unknown<'e>], 
         MontyNode::BigInt(bi) => create_js_bigint(bi, env),
         MontyNode::Float(f) => env.create_double(*f)?.into_unknown(env),
         MontyNode::Complex(c) => create_js_complex(c, env),
+        MontyNode::Decimal(d) => create_js_decimal(d, env),
         MontyNode::String(s) => env.create_string(s)?.into_unknown(env),
         MontyNode::Bytes(bytes) => create_js_buffer(bytes, env),
         MontyNode::List(items) => create_js_array(&children(items), env)?.into_unknown(env),
@@ -141,6 +144,15 @@ fn decode_node<'e>(node: &MontyNode, graph: &MontyGraph, built: &[Unknown<'e>], 
             obj.set_named_property("type", class_object)?;
             // uuids as canonical lowercase strings — JS has no 128-bit integer type
             obj.set_named_property("instanceId", instance_id.to_string())?;
+            obj.set_named_property("attrs", create_js_attr_pairs(attrs, graph, built, env)?)?;
+            obj.into_unknown(env)
+        }
+        // the TS layer restores the marker to an `ExternalModule` with the same id
+        MontyNode::Module { name, id, attrs } => {
+            let mut obj = Object::new(env)?;
+            obj.set_named_property("__monty_type__", "Module")?;
+            obj.set_named_property("name", name.as_str())?;
+            obj.set_named_property("id", id.to_string())?;
             obj.set_named_property("attrs", create_js_attr_pairs(attrs, graph, built, env)?)?;
             obj.into_unknown(env)
         }
@@ -330,6 +342,14 @@ fn create_js_complex<'e>(c: &MontyComplex, env: &'e Env) -> Result<Unknown<'e>> 
     obj.set_named_property("__monty_type__", "Complex")?;
     obj.set_named_property("real", c.real)?;
     obj.set_named_property("imag", c.imag)?;
+    obj.into_unknown(env)
+}
+
+/// Creates a JS object representing a Python `decimal.Decimal` by its exact string form.
+fn create_js_decimal<'e>(value: &str, env: &'e Env) -> Result<Unknown<'e>> {
+    let mut obj = Object::new(env)?;
+    obj.set_named_property("__monty_type__", "Decimal")?;
+    obj.set_named_property("value", value)?;
     obj.into_unknown(env)
 }
 
@@ -743,6 +763,7 @@ impl<'e> GraphEncoder<'e> {
                 real: obj.get_named_property::<f64>("real")?,
                 imag: obj.get_named_property::<f64>("imag")?,
             }),
+            "Decimal" => MontyNode::Decimal(obj.get_named_property::<String>("value")?),
             "TimeDelta" => MontyNode::TimeDelta(MontyTimeDelta {
                 days: obj.get_named_property::<i32>("days")?,
                 seconds: obj.get_named_property::<i32>("seconds")?,
@@ -791,6 +812,14 @@ impl<'e> GraphEncoder<'e> {
                     let mut children = vec![Child::ClassType(class_type)];
                     children.extend(js_attr_pairs(obj.get_named_property("attrs")?, "ClassInstance")?);
                     Ok((Pending::ClassInstance { instance_id }, children))
+                });
+            }
+            "Module" => {
+                return self.enter(obj, |_| {
+                    let name = get_required_string_property(&obj, "name", "Module")?;
+                    let id = get_uuid_string_property(&obj, "id", "Module")?;
+                    let children = js_attr_pairs(obj.get_named_property("attrs")?, "Module")?;
+                    Ok((Pending::Module { name, id }, children))
                 });
             }
             _ => return Err(Error::from_reason(format!("Unknown Monty marker type: {monty_type}"))),
@@ -875,6 +904,11 @@ impl<'e> GraphEncoder<'e> {
                     attrs: id_pairs(&ids[1..]),
                 }
             }
+            Pending::Module { name, id } => MontyNode::Module {
+                name,
+                id,
+                attrs: id_pairs(&ids),
+            },
         };
         let attr_less_class = match &node {
             MontyNode::ClassType(class) if class.attrs.is_empty() => Some(class.id),
@@ -978,6 +1012,11 @@ enum Pending {
     /// The first child is the class node, then attr name, value pairs.
     ClassInstance {
         instance_id: MontyUuid,
+    },
+    /// Children alternate attr name, value.
+    Module {
+        name: String,
+        id: MontyUuid,
     },
 }
 

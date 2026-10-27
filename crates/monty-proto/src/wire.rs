@@ -339,6 +339,8 @@ mod tag {
     pub const REPR: u32 = 29;
     pub const CYCLE: u32 = 30;
     pub const COMPLEX: u32 = 31;
+    pub const MODULE: u32 = 32;
+    pub const DECIMAL: u32 = 33;
 }
 
 // ============================================================================
@@ -455,8 +457,17 @@ fn encode_node(node: &MontyNode, buf: &mut impl BufMut) {
             encode_message_key(3, node_pairs_len(1, attrs), buf);
             encode_node_pairs(1, attrs, buf);
         }
+        MontyNode::Module { name, id, attrs } => {
+            let id = uuid_to_pb(id);
+            encode_message_key(tag::MODULE, module_len(name, &id, attrs), buf);
+            encode_str(1, name, buf);
+            encoding::message::encode(2, &id, buf);
+            encode_message_key(3, node_pairs_len(1, attrs), buf);
+            encode_node_pairs(1, attrs, buf);
+        }
         MontyNode::BuiltinFunction(bf) => encoding::string::encode(tag::BUILTIN_FUNCTION, &bf.to_string(), buf),
         MontyNode::Path(p) => encoding::string::encode(tag::PATH, p, buf),
+        MontyNode::Decimal(d) => encoding::string::encode(tag::DECIMAL, d, buf),
         MontyNode::FileHandle(fh) => {
             encode_message_key(tag::FILE_HANDLE, file_handle_len(fh), buf);
             encode_str(1, &fh.path, buf);
@@ -520,8 +531,10 @@ fn node_len(node: &MontyNode) -> usize {
             tag::CLASS_INSTANCE,
             class_instance_len(*class_type, &uuid_to_pb(instance_id), attrs),
         ),
+        MontyNode::Module { name, id, attrs } => submessage_len(tag::MODULE, module_len(name, &uuid_to_pb(id), attrs)),
         MontyNode::BuiltinFunction(bf) => encoding::string::encoded_len(tag::BUILTIN_FUNCTION, &bf.to_string()),
         MontyNode::Path(p) => encoding::string::encoded_len(tag::PATH, p),
+        MontyNode::Decimal(d) => encoding::string::encoded_len(tag::DECIMAL, d),
         MontyNode::FileHandle(fh) => submessage_len(tag::FILE_HANDLE, file_handle_len(fh)),
         MontyNode::Function { name, docstring } => {
             submessage_len(tag::FUNCTION, str_len(1, name) + opt_str_len(2, docstring.as_deref()))
@@ -657,6 +670,11 @@ fn class_origin(class: &ClassTypeNode) -> pb::TypeOrigin {
 /// NodePairs attrs = 3`.
 fn class_instance_len(class_type: NodeId, id: &pb::Uuid, attrs: &[(NodeId, NodeId)]) -> usize {
     uint32_len(1, class_type.0) + encoding::message::encoded_len(2, id) + submessage_len(3, node_pairs_len(1, attrs))
+}
+
+/// `ModuleNode` body: `name = 1`, `id = 2`, `attrs = 3`.
+fn module_len(name: &str, id: &pb::Uuid, attrs: &[(NodeId, NodeId)]) -> usize {
+    str_len(1, name) + encoding::message::encoded_len(2, id) + submessage_len(3, node_pairs_len(1, attrs))
 }
 
 /// `DateTime` body: scalar fields 1–7 (implicit presence, skipped at
@@ -840,6 +858,9 @@ fn node_from_proto(node: pb::MontyNode) -> Result<MontyNode, DecodeError> {
         },
         Kind::Dict(value) => MontyNode::Dict(value.0.into_inner()),
         Kind::Path(value) => MontyNode::Path(value),
+        // Validated by whoever turns the text into a `Decimal`: the sandbox parses
+        // it, the bindings call their own `Decimal` constructor.
+        Kind::Decimal(value) => MontyNode::Decimal(value),
         Kind::Function(value) => MontyNode::Function {
             name: value.name,
             docstring: value.docstring,
@@ -858,6 +879,19 @@ fn node_from_proto(node: pb::MontyNode) -> Result<MontyNode, DecodeError> {
             MontyNode::ClassInstance {
                 class_type: NodeId(value.class_type),
                 instance_id: pb_uuid_to_monty(&instance_id, "ClassInstanceNode.instance_id")?,
+                attrs: attrs.0.into_inner(),
+            }
+        }
+        Kind::Module(value) => {
+            let id = value
+                .id
+                .ok_or_else(|| to_decode_err(ProtoConvertError::MissingField("ModuleNode.id")))?;
+            let attrs = value
+                .attrs
+                .ok_or_else(|| to_decode_err(ProtoConvertError::MissingField("ModuleNode.attrs")))?;
+            MontyNode::Module {
+                name: value.name,
+                id: pb_uuid_to_monty(&id, "ModuleNode.id")?,
                 attrs: attrs.0.into_inner(),
             }
         }
